@@ -53,13 +53,11 @@ jobs:
             date
             echo "========================================="
 
-            # Check required commands
             command -v git
             command -v node
             command -v npm
             command -v pm2
 
-            # Check application directory
             if [ ! -d "$APP_DIR/.git" ]; then
               echo "ERROR: Git repository not found in $APP_DIR"
               exit 1
@@ -67,7 +65,6 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Preserve .env and logs directory
             if [ ! -f "$APP_DIR/.env" ]; then
               echo "ERROR: .env file is missing!"
               exit 1
@@ -78,13 +75,10 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            # Clean untracked files, preserving .env and logs
             git clean -fd -e .env -e logs/
 
-            # Ensure logs directory exists BEFORE PM2 reload
             mkdir -p "$APP_DIR/logs"
 
-            # Validate required files
             echo "Checking required files..."
 
             test -f package.json
@@ -93,43 +87,40 @@ jobs:
             test -f ecosystem.config.js
             test -f .env
 
-            # Install production dependencies
             echo "Installing production dependencies..."
+
             npm ci --omit=dev
 
-            # Ensure PM2 is available
             pm2 --version
 
-            # Restart application
             echo "Restarting backend..."
 
-            # Remove existing PM2 app to avoid reload issues
             if pm2 describe backend-api >/dev/null 2>&1; then
               pm2 delete backend-api
             fi
 
-            # Start fresh using ecosystem config
             pm2 start ecosystem.config.js --env production
 
-            # Save PM2 process list
             pm2 save
 
             echo "Waiting for backend..."
+
             sleep 8
 
-            # Show PM2 status
             pm2 status
 
-            # Health check with retries
             echo "Running health check..."
 
             HEALTH_URL="http://127.0.0.1:5000/api/health"
             HEALTH_OK=0
 
             for i in $(seq 1 12); do
-              HTTP_CODE=$(curl -sS -o /tmp/backend-health.json \
+
+              HTTP_CODE=$(curl -sS \
+                -o /tmp/backend-health.json \
                 -w "%{http_code}" \
-                --max-time 5 "$HEALTH_URL" || true)
+                --max-time 5 \
+                "$HEALTH_URL" || true)
 
               echo "Health check attempt $i: HTTP $HTTP_CODE"
 
@@ -142,8 +133,8 @@ jobs:
               sleep 5
             done
 
-            # Diagnostics if health check fails
             if [ "$HEALTH_OK" -ne 1 ]; then
+
               echo "ERROR: Health check failed"
 
               echo "----- PM2 STATUS -----"
