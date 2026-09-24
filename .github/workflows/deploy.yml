@@ -1,132 +1,170 @@
-name: Deploy Backend to AWS EC2
+name: Deploy MERN Backend to EC2
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  id-token: write
-  contents: read
+  workflow_dispatch:
 
 jobs:
   test:
-    name: Test Application
-    runs-on: ubuntu-latest
+    name: Test Backend
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: 24
+          cache: npm
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: npm ci
 
-      - name: Check for syntax errors
+      - name: Check Server Syntax
         run: node --check src/server.js
 
   deploy:
-    name: Deploy to EC2
-    runs-on: ubuntu-latest
+    name: Deploy to AWS EC2
     needs: test
-    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
-
-      - name: Deploy to EC2 via SSH
+      - name: Deploy Backend via SSH
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          port: 22
-          command_timeout: 10m
+          command_timeout: 15m
+
           script: |
             set -e
 
+            APP_DIR="/var/www/backend"
+            REPO="https://github.com/myselfrahul1510/mern-backend-gh-action.git"
+
             echo "========================================="
             echo "DEPLOYMENT STARTED"
-            echo "Time: $(date)"
+            date
             echo "========================================="
 
-            APP_DIR="/var/www/backend"
-            REPO_URL="<https://github.com/$>{{ github.repository }}.git"
-            BRANCH="main"
+            # Check required commands
+            command -v git
+            command -v node
+            command -v npm
+            command -v pm2
 
-            if [ -d "$APP_DIR/.git" ]; then
-              echo "Repository exists. Pulling latest changes..."
-              cd $APP_DIR
-              git fetch origin $BRANCH
-              git reset --hard origin/$BRANCH
-              git clean -fd
-            else
-              echo "Cloning repository for the first time..."
-              if [ -f "$APP_DIR/.env" ]; then
-                cp $APP_DIR/.env /tmp/backend-env-backup
-              fi
-              if [ -f "$APP_DIR/ecosystem.config.js" ]; then
-                cp $APP_DIR/ecosystem.config.js /tmp/backend-ecosystem-backup
-              fi
-
-              rm -rf $APP_DIR/*
-              git clone --branch $BRANCH --single-branch $REPO_URL $APP_DIR
-              cd $APP_DIR
-
-              if [ -f "/tmp/backend-env-backup" ]; then
-                cp /tmp/backend-env-backup $APP_DIR/.env
-                rm /tmp/backend-env-backup
-              fi
-              if [ -f "/tmp/backend-ecosystem-backup" ]; then
-                cp /tmp/backend-ecosystem-backup $APP_DIR/ecosystem.config.js
-                rm /tmp/backend-ecosystem-backup
-              fi
+            # Check application directory
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "ERROR: Git repository not found in $APP_DIR"
+              exit 1
             fi
 
-            echo "Installing dependencies..."
-            cd $APP_DIR
-            npm ci --production
+            cd "$APP_DIR"
 
-            echo "Restarting application with PM2..."
-            if pm2 describe backend-api > /dev/null 2>&1; then
-              pm2 reload ecosystem.config.js --env production
-            else
-              pm2 start ecosystem.config.js --env production
+            # Preserve .env and logs directory
+            if [ ! -f "$APP_DIR/.env" ]; then
+              echo "ERROR: .env file is missing!"
+              exit 1
             fi
 
+            echo "Updating repository..."
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Clean untracked files, preserving .env and logs
+            git clean -fd -e .env -e logs/
+
+            # Ensure logs directory exists BEFORE PM2 reload
+            mkdir -p "$APP_DIR/logs"
+
+            # Validate required files
+            echo "Checking required files..."
+
+            test -f package.json
+            test -f package-lock.json
+            test -f src/server.js
+            test -f ecosystem.config.js
+            test -f .env
+
+            # Install production dependencies
+            echo "Installing production dependencies..."
+            npm ci --omit=dev
+
+            # Ensure PM2 is available
+            pm2 --version
+
+            # Restart application
+            echo "Restarting backend..."
+
+            # Remove existing PM2 app to avoid reload issues
+            if pm2 describe backend-api >/dev/null 2>&1; then
+              pm2 delete backend-api
+            fi
+
+            # Start fresh using ecosystem config
+            pm2 start ecosystem.config.js --env production
+
+            # Save PM2 process list
             pm2 save
 
-            echo "Waiting for application to start..."
-            sleep 5
+            echo "Waiting for backend..."
+            sleep 8
 
-            echo "Health check..."
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" <http://localhost:5000/api/health> || echo "000")
+            # Show PM2 status
+            pm2 status
 
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "SUCCESS: Health check passed (HTTP $HTTP_STATUS)"
-            else
-              echo "WARNING: Health check returned HTTP $HTTP_STATUS"
-              echo "Checking PM2 logs for errors..."
-              pm2 logs backend-api --lines 20 --nostream
+            # Health check with retries
+            echo "Running health check..."
+
+            HEALTH_URL="http://127.0.0.1:5000/api/health"
+            HEALTH_OK=0
+
+            for i in $(seq 1 12); do
+              HTTP_CODE=$(curl -sS -o /tmp/backend-health.json \
+                -w "%{http_code}" \
+                --max-time 5 "$HEALTH_URL" || true)
+
+              echo "Health check attempt $i: HTTP $HTTP_CODE"
+
+              if [ "$HTTP_CODE" = "200" ]; then
+                cat /tmp/backend-health.json
+                HEALTH_OK=1
+                break
+              fi
+
+              sleep 5
+            done
+
+            # Diagnostics if health check fails
+            if [ "$HEALTH_OK" -ne 1 ]; then
+              echo "ERROR: Health check failed"
+
+              echo "----- PM2 STATUS -----"
+              pm2 status || true
+
+              echo "----- PM2 DESCRIPTION -----"
+              pm2 describe backend-api || true
+
+              echo "----- PM2 LOGS -----"
+              pm2 logs backend-api --lines 100 --nostream || true
+
+              echo "----- LISTENING PORTS -----"
+              sudo ss -lntp || true
+
+              echo "----- LOG DIRECTORY -----"
+              ls -la "$APP_DIR/logs" || true
+
+              exit 1
             fi
 
             echo "========================================="
-            echo "DEPLOYMENT FINISHED"
-            echo "Time: $(date)"
+            echo "DEPLOYMENT SUCCESSFUL"
+            date
             echo "========================================="
