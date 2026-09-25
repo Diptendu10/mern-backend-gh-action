@@ -7,3 +7,4 @@ build/
 *.pem
 .DS_Store
 gha-deploy*
+ecosystem.config.js
